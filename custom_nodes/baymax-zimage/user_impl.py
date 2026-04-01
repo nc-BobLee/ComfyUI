@@ -1,30 +1,55 @@
-"""User-editable rotary implementation for the baymax-zimage node.
+"""User-editable RMSnorm implementation for the baymax-zimage node.
 
-Edit apply_rotary_emb and then run the baymax-zimage node with reload enabled.
-The z-Image transformer in this repository calls apply_rope internally, so the
-node adapts that call into this apply_rotary_emb interface.
+Edit apply_rmsnorm and then run the baymax-zimage node with reload enabled.
+The node patches ComfyUI RMSNorm.forward used by z-Image NextDiT, and adapts
+that call into this apply_rmsnorm interface.
 """
 
-def apply_rotary_emb(xq, xk, freqs_cis, original_apply_rope=None):
-    if freqs_cis is None:
-        if original_apply_rope is None:
-            raise RuntimeError("freqs_cis is None and no original_apply_rope fallback is available")
-        return original_apply_rope(xq, xk, freqs_cis)
+import torch
 
-    # Standalone rotary implementation compatible with z-Image NextDiT paths.
-    def _apply_single(x):
-        if x is None:
-            return None
+@torch.compile(mode="max-autotune")
+def apply_rmsnorm(x, weight=None, original_apply_rmsnorm=None, eps=1e-6):
+    """
+    Root Mean Square Normalization (RMSnorm) implementation.
+    
+    RMSnorm(x) = x / RMS(x) * weight
+    where RMS(x) = sqrt(mean(x^2) + eps)
+    
+    Args:
+        x: Input tensor to normalize
+        weight: Optional scaling factor. If None, uses unit scaling
+        original_apply_rmsnorm: Original implementation fallback
+        eps: Small epsilon value for numerical stability (default: 1e-6)
+    
+    Returns:
+        Normalized tensor with same shape as input
+    """
+    #print(f'baymax run in user RMSNorm!')
+    if x is None:
+        if original_apply_rmsnorm is None:
+            raise RuntimeError("x is None and no original_apply_rmsnorm fallback is available")
+        return original_apply_rmsnorm(x, weight)
 
-        x_work = x.to(dtype=freqs_cis.dtype).reshape(*x.shape[:-1], -1, 1, 2)
-        fc = freqs_cis
-
-        # Match the half-dim slice used by this q/k tensor.
-        if x_work.shape[2] != 1 and fc.shape[2] != 1 and x_work.shape[2] != fc.shape[2]:
-            fc = fc[:, :, :x_work.shape[2]]
-
-        x_out = fc[..., 0] * x_work[..., 0]
-        x_out.addcmul_(fc[..., 1], x_work[..., 1])
-        return x_out.reshape(*x.shape).type_as(x)
-
-    return _apply_single(xq), _apply_single(xk)
+    if eps is None:
+        eps = 1e-6
+    
+    # Store original dtype
+    original_dtype = x.dtype
+    
+    # Ensure x is float32 for numerical stability
+    x_float = x.to(dtype=torch.float32)
+    
+    # Calculate RMS along the last dimension
+    # RMS(x) = sqrt(mean(x^2) + eps)
+    rms = torch.sqrt((x_float ** 2).mean(dim=-1, keepdim=True) + eps)
+    
+    # Normalize by RMS
+    x_norm = x_float / rms
+    
+    # Apply scaling factor (weight) if provided
+    if weight is not None:
+        weight_float = weight.to(dtype=torch.float32) if weight.dtype != torch.float32 else weight
+        x_norm = x_norm * weight_float
+    
+    # Convert back to original dtype
+    return x_norm.to(dtype=original_dtype)
