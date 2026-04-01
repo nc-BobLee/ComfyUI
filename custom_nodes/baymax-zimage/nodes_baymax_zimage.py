@@ -4,8 +4,11 @@ import importlib
 import importlib.util
 import inspect
 import logging
+import sys
 import threading
 from pathlib import Path
+
+import torch
 from types import ModuleType
 from typing import Callable, Dict, Iterable, Tuple
 
@@ -56,59 +59,91 @@ def _target_modules() -> Iterable[Tuple[object, str]]:
     return tuple(targets)
 
 
+_USER_IMPL_MODULE_NAME = "baymax_zimage_user_impl"
+
+
 def _load_user_module() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("baymax_zimage_user_impl", _USER_IMPL_PATH)
+    spec = importlib.util.spec_from_file_location(_USER_IMPL_MODULE_NAME, _USER_IMPL_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load user implementation from {_USER_IMPL_PATH}")
 
     module = importlib.util.module_from_spec(spec)
+    # Register *before* exec so that any internal self-imports resolve correctly,
+    # and so torch.compiler / Dynamo can locate the module by name during tracing.
+    sys.modules[_USER_IMPL_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
 
 
-def _call_user_impl(user_function: Callable, original_function: Callable, module_self, x):
-    signature = inspect.signature(user_function)
-    parameters = signature.parameters
-    parameter_values = parameters.values()
+def _resolve_call_convention(user_function: Callable, original_function: Callable) -> Callable:
+    """Inspect the user function signature *once at patch-install time* and return
+    a thin caller that Dynamo can trace without graph breaks.
+
+    The returned caller has the signature ``(module_self, x)`` and forwards to
+    user_function using only attribute look-ups and tensor ops — nothing that
+    requires dynamic Python evaluation on each call.
+    """
+    sig = inspect.signature(user_function)
+    params = sig.parameters
     positional_slots = sum(
-        1
-        for parameter in parameter_values
-        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        1 for p in params.values()
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
     )
-    has_varargs = any(parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in parameter_values)
-    has_varkw = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameter_values)
+    has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params.values())
+    has_varkw   = any(p.kind == inspect.Parameter.VAR_KEYWORD   for p in params.values())
 
-    weight = getattr(module_self, "weight", None)
-    eps = getattr(module_self, "eps", 1e-6)
+    want_original = "original_apply_rmsnorm" in params or has_varkw
+    want_eps      = "eps"    in params or has_varkw
+    want_module   = "module" in params or has_varkw
 
-    def fallback(x_in, weight_in=None):
-        del weight_in
-        return original_function(module_self, x_in)
+    if want_original or want_eps or want_module:
+        # Keyword path — still passes the fallback/eps/module by name.
+        # The fallback closure is a non-tensor constant; Dynamo treats it as a
+        # compile-time constant and does NOT trace into it unless called, so
+        # user_function itself (the tensor math) is still fully compiled.
+        def caller(module_self, x):
+            kw: dict = {}
+            if want_original:
+                def _fb(x_in, weight_in=None):
+                    return original_function(module_self, x_in)
+                kw["original_apply_rmsnorm"] = _fb
+            if want_eps:
+                kw["eps"] = module_self.eps
+            if want_module:
+                kw["module"] = module_self
+            return user_function(x, module_self.weight, **kw)
 
-    args = [x, weight]
-    kwargs = {}
+    elif positional_slots >= 3 or has_varargs:
+        # Three-positional path: (x, weight, fallback)
+        def caller(module_self, x):
+            def _fb(x_in, weight_in=None):
+                return original_function(module_self, x_in)
+            return user_function(x, module_self.weight, _fb)
 
-    if "original_apply_rmsnorm" in parameters or has_varkw:
-        kwargs["original_apply_rmsnorm"] = fallback
-    if "eps" in parameters or has_varkw:
-        kwargs["eps"] = eps
-    if "module" in parameters or has_varkw:
-        kwargs["module"] = module_self
+    elif positional_slots == 2:
+        # Pure two-argument path: (x, weight) — fully traceable, no fallback.
+        def caller(module_self, x):
+            return user_function(x, module_self.weight)
 
-    if positional_slots >= 3 and "original_apply_rmsnorm" not in kwargs:
-        args.append(fallback)
+    else:
+        # Single-argument path: (x,)
+        def caller(module_self, x):
+            return user_function(x)
 
-    if positional_slots < len(args) and not has_varargs:
-        args = args[:max(positional_slots, 0)]
-
-    return user_function(*args, **kwargs)
+    return caller
 
 
 def _make_wrapper(module_name: str, user_function: Callable) -> Callable:
     original_function = _ORIGINAL_FUNCTIONS[(module_name, "forward")]
 
+    # Resolve calling convention *once* at install time — the hot path
+    # (patched_forward) then contains only a direct call forwarded through
+    # ``caller``, so Dynamo can trace straight through into user_function
+    # without any graph breaks from reflect/inspect calls.
+    caller = _resolve_call_convention(user_function, original_function)
+
     def patched_forward(self, x):
-        return _call_user_impl(user_function, original_function, self, x)
+        return caller(self, x)
 
     patched_forward.__name__ = "forward"
     patched_forward.__module__ = __name__
