@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import inspect
 import logging
 import sys
 import threading
 from pathlib import Path
 
-import torch
 from types import ModuleType
 from typing import Callable, Dict, Iterable, Tuple
 
@@ -26,21 +24,21 @@ def _target_name(target: object) -> str:
     return f"{module_name}.{qualname}"
 
 
-def _available_targets() -> Tuple[Tuple[object, str], ...]:
-    targets = []
-    for target, attribute_name in _target_modules():
+def _available_targets(candidates: Iterable[Tuple[object, str]]) -> Tuple[Tuple[object, str], ...]:
+    available = []
+    for target, attribute_name in candidates:
         if hasattr(target, attribute_name):
-            targets.append((target, attribute_name))
+            available.append((target, attribute_name))
         else:
             logger.warning(
                 "[baymax-zimage] Skipping %s.%s because it does not exist",
                 _target_name(target),
                 attribute_name,
             )
-    return tuple(targets)
+    return tuple(available)
 
 
-def _target_modules() -> Iterable[Tuple[object, str]]:
+def _rmsnorm_target_modules() -> Iterable[Tuple[object, str]]:
     ops = importlib.import_module("comfy.ops")
     targets = []
 
@@ -59,6 +57,15 @@ def _target_modules() -> Iterable[Tuple[object, str]]:
     return tuple(targets)
 
 
+def _rope_target_modules() -> Iterable[Tuple[object, str]]:
+    # Patch both the source function in flux.math and the bound symbol imported
+    # by lumina.model so z-Image paths pick up the custom implementation.
+    return (
+        (importlib.import_module("comfy.ldm.flux.math"), "apply_rope"),
+        (importlib.import_module("comfy.ldm.lumina.model"), "apply_rope"),
+    )
+
+
 _USER_IMPL_MODULE_NAME = "baymax_zimage_user_impl"
 
 
@@ -75,109 +82,65 @@ def _load_user_module() -> ModuleType:
     return module
 
 
-def _resolve_call_convention(user_function: Callable, original_function: Callable) -> Callable:
-    """Inspect the user function signature *once at patch-install time* and return
-    a thin caller that Dynamo can trace without graph breaks.
-
-    The returned caller has the signature ``(module_self, x)`` and forwards to
-    user_function using only attribute look-ups and tensor ops — nothing that
-    requires dynamic Python evaluation on each call.
-    """
-    sig = inspect.signature(user_function)
-    params = sig.parameters
-    positional_slots = sum(
-        1 for p in params.values()
-        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    )
-    has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params.values())
-    has_varkw   = any(p.kind == inspect.Parameter.VAR_KEYWORD   for p in params.values())
-
-    want_original = "original_apply_rmsnorm" in params or has_varkw
-    want_eps      = "eps"    in params or has_varkw
-    want_module   = "module" in params or has_varkw
-
-    if want_original or want_eps or want_module:
-        # Keyword path — still passes the fallback/eps/module by name.
-        # The fallback closure is a non-tensor constant; Dynamo treats it as a
-        # compile-time constant and does NOT trace into it unless called, so
-        # user_function itself (the tensor math) is still fully compiled.
-        def caller(module_self, x):
-            kw: dict = {}
-            if want_original:
-                def _fb(x_in, weight_in=None):
-                    return original_function(module_self, x_in)
-                kw["original_apply_rmsnorm"] = _fb
-            if want_eps:
-                kw["eps"] = module_self.eps
-            if want_module:
-                kw["module"] = module_self
-            return user_function(x, module_self.weight, **kw)
-
-    elif positional_slots >= 3 or has_varargs:
-        # Three-positional path: (x, weight, fallback)
-        def caller(module_self, x):
-            def _fb(x_in, weight_in=None):
-                return original_function(module_self, x_in)
-            return user_function(x, module_self.weight, _fb)
-
-    elif positional_slots == 2:
-        # Pure two-argument path: (x, weight) — fully traceable, no fallback.
-        def caller(module_self, x):
-            return user_function(x, module_self.weight)
-
-    else:
-        # Single-argument path: (x,)
-        def caller(module_self, x):
-            return user_function(x)
-
-    return caller
-
-
-def _make_wrapper(module_name: str, user_function: Callable) -> Callable:
-    original_function = _ORIGINAL_FUNCTIONS[(module_name, "forward")]
-
-    # Resolve calling convention *once* at install time — the hot path
-    # (patched_forward) then contains only a direct call forwarded through
-    # ``caller``, so Dynamo can trace straight through into user_function
-    # without any graph breaks from reflect/inspect calls.
-    caller = _resolve_call_convention(user_function, original_function)
-
+def _make_wrapper(user_function: Callable) -> Callable:
+    # patched_forward calls apply_rmsnorm(x, weight, eps=eps) directly.
+    # No dynamic Python in the hot path — Dynamo can trace straight through.
     def patched_forward(self, x):
-        return caller(self, x)
+        eps = self.eps if self.eps is not None else 1e-6
+        return user_function(x, self.weight, eps=eps)
 
     patched_forward.__name__ = "forward"
     patched_forward.__module__ = __name__
     return patched_forward
 
 
-def _patch_rmsnorm(enable: bool, reload_user_impl: bool) -> str:
-    del reload_user_impl  # The user module is reloaded on every execution.
+def _make_rope_wrapper(user_function: Callable) -> Callable:
+    def patched_apply_rope(xq, xk, freqs_cis):
+        return user_function(xq, xk, freqs_cis)
 
+    patched_apply_rope.__name__ = "apply_rope"
+    patched_apply_rope.__module__ = __name__
+    return patched_apply_rope
+
+
+def _patch_baymax(enable: bool) -> Dict[str, str]:
     with _PATCH_LOCK:
-        targets = list(_available_targets())
-        if not targets:
-            raise RuntimeError("No RMSNorm forward targets were found in comfy.ops")
+        rmsnorm_targets = list(_available_targets(_rmsnorm_target_modules()))
+        rope_targets = list(_available_targets(_rope_target_modules()))
 
-        for target, attribute_name in targets:
+        if not rmsnorm_targets:
+            raise RuntimeError("No RMSNorm forward targets were found in comfy.ops")
+        if not rope_targets:
+            raise RuntimeError("No apply_rope targets were found in comfy.ldm.flux/lumina")
+
+        all_targets = rmsnorm_targets + rope_targets
+
+        for target, attribute_name in all_targets:
             key = (_target_name(target), attribute_name)
             _ORIGINAL_FUNCTIONS.setdefault(key, getattr(target, attribute_name))
 
         if not enable:
-            for target, attribute_name in targets:
+            for target, attribute_name in all_targets:
                 setattr(target, attribute_name, _ORIGINAL_FUNCTIONS[(_target_name(target), attribute_name)])
-            logger.info("[baymax-zimage] Restored the default z-Image RMSnorm implementation")
-            return "restored"
+            logger.info("[baymax-zimage] Restored default z-Image RMSNorm and apply_rope implementations")
+            return {"rmsnorm": "restored", "apply_rope": "restored"}
 
         user_module = _load_user_module()
-        user_function = getattr(user_module, "apply_rmsnorm", None)
-        if not callable(user_function):
+        user_rmsnorm = getattr(user_module, "apply_rmsnorm", None)
+        user_rope = getattr(user_module, "apply_rope", None)
+
+        if not callable(user_rmsnorm):
             raise RuntimeError(f"{_USER_IMPL_PATH} must define a callable apply_rmsnorm function")
+        if not callable(user_rope):
+            raise RuntimeError(f"{_USER_IMPL_PATH} must define a callable apply_rope function")
 
-        for target, attribute_name in targets:
-            setattr(target, attribute_name, _make_wrapper(_target_name(target), user_function))
+        for target, attribute_name in rmsnorm_targets:
+            setattr(target, attribute_name, _make_wrapper(user_rmsnorm))
+        for target, attribute_name in rope_targets:
+            setattr(target, attribute_name, _make_rope_wrapper(user_rope))
 
-        logger.info("[baymax-zimage] Installed user RMSnorm implementation from %s", _USER_IMPL_PATH)
-        return "patched"
+        logger.info("[baymax-zimage] Installed user RMSNorm + apply_rope implementations from %s", _USER_IMPL_PATH)
+        return {"rmsnorm": "patched", "apply_rope": "patched"}
 
 
 class BaymaxZImage:
@@ -187,7 +150,6 @@ class BaymaxZImage:
             "required": {
                 "model": ("MODEL",),
                 "enable": ("BOOLEAN", {"default": True}),
-                "reload_user_impl": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -196,11 +158,11 @@ class BaymaxZImage:
     FUNCTION = "patch_model"
     CATEGORY = "baymax"
     DESCRIPTION = (
-        "Patch ComfyUI RMSNorm forward used by z-Image NextDiT with the implementation in "
+        "Patch ComfyUI RMSNorm forward and flux/lumina apply_rope used by z-Image NextDiT with implementations in "
         "custom_nodes/baymax-zimage/user_impl.py."
     )
 
-    def patch_model(self, model, enable=True, reload_user_impl=True):
+    def patch_model(self, model, enable=True):
         diffusion_model = getattr(getattr(model, "model", None), "diffusion_model", None)
         if diffusion_model is not None and diffusion_model.__class__.__name__ != "NextDiTPixelSpace":
             logger.warning(
@@ -209,7 +171,7 @@ class BaymaxZImage:
             )
 
         patched_model = model.clone()
-        status = _patch_rmsnorm(enable=enable, reload_user_impl=reload_user_impl)
+        status = _patch_baymax(enable=enable)
 
         transformer_options = patched_model.model_options.setdefault("transformer_options", {})
         transformer_options["baymax_zimage"] = {
